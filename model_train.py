@@ -1,93 +1,63 @@
 import pandas as pd
 import lightgbm as lgb
-import glob
-import os
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, accuracy_score
-import joblib
+import os
 
-# Configuration
-INPUT_DIR = "statcast_final"
-MODEL_PATH = "pitch_zone_model.txt"
-
-# 1. Select the features that actually help predict the zone
-# We exclude things like 'game_pk' or 'game_date' which don't help prediction
+# 1. Configuration
+INPUT_FILE = "statcast_final/final_2024.parquet"
 FEATURES = [
-    'balls', 'strikes', 'outs_when_up', 'inning', 'inning_topbot',
-    'stand', 'p_throws', 'home_score', 'away_score',
-    'on_1b', 'on_2b', 'on_3b',
+    'pitcher', 'batter', 'balls', 'strikes', 'outs_when_up', 
+    'stand', 'p_throws', 'on_1b', 'on_2b', 'on_3b',
     'batter_rolling_whiff_rate', 'pitcher_ff_usage',
     'prev_pitch_type', 'prev_zone'
 ]
-TARGET = 'zone'
+CAT_FEATURES = ['pitcher', 'batter', 'prev_pitch_type', 'prev_zone', 'stand', 'p_throws']
 
-# Categorical features tell LightGBM to treat them as groups, not numbers
-CAT_FEATURES = ['prev_pitch_type', 'prev_zone', 'inning_topbot', 'stand', 'p_throws']
-
-def load_and_prepare_data():
-    all_files = sorted(glob.glob(f"{INPUT_DIR}/final_*.parquet"))
-    df_list = []
+def train_dual_optimized():
+    print("Loading 2024 data...")
+    df = pd.read_parquet(INPUT_FILE)
     
-    for f in all_files:
-        print(f"Loading {os.path.basename(f)}...")
-        # Only load the columns we need to save RAM
-        df_year = pd.read_parquet(f, columns=FEATURES + [TARGET])
-        df_list.append(df_year)
-    
-    df = pd.concat(df_list, ignore_index=True)
-    
-    # LightGBM prefers categorical columns to be type 'category'
+    # Critical: Convert to category types
     for col in CAT_FEATURES:
         df[col] = df[col].astype('category')
-        
-    return df
 
-def train_pitch_model():
-    # Load Data
-    df = load_and_prepare_data()
-    print(f"Total Rows: {len(df)}")
-
-    # Split into Features (X) and Target (y)
     X = df[FEATURES]
-    y = df[TARGET]
-
-    # Split into Training and Testing sets (80/20 split)
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-    print("Starting LightGBM Training...")
     
-    # Initialize the LightGBM Classifier
-    # n_estimators: Number of trees. 500 is a good start for this much data.
-    # learning_rate: Low rate helps accuracy but takes longer.
-    model = lgb.LGBMClassifier(
-        n_estimators=500,
-        learning_rate=0.05,
-        num_leaves=64,
+    # --- MODEL 1: ARSENAL (Pitch Type) ---
+    print("\n--- Training Model 1: Pitch Type ---")
+    y_type = df['pitch_type'].astype('category')
+    X_train, X_test, y_train, y_test = train_test_split(X, y_type, test_size=0.2, random_state=42)
+    
+    type_model = lgb.LGBMClassifier(
+        n_estimators=1500,
+        learning_rate=0.03, # Slightly faster for pitch type as it's a clearer signal
+        num_leaves=128,
+        class_weight='balanced',
         objective='multiclass',
-        random_state=42,
-        n_jobs=-1 # Use all CPU cores
+        n_jobs=-1
     )
+    type_model.fit(X_train, y_train, eval_set=[(X_test, y_test)], 
+                   callbacks=[lgb.early_stopping(stopping_rounds=50)])
+    type_model.booster_.save_model("model_type_optimized.txt")
 
-    # Train
-    model.fit(
-        X_train, y_train,
-        eval_set=[(X_test, y_test)],
-        callbacks=[lgb.early_stopping(stopping_rounds=20)]
-    )
-
-    # 4. Evaluate
-    y_pred = model.predict(X_test)
-    print("\n--- Model Performance ---")
-    print(f"Accuracy: {accuracy_score(y_test, y_pred):.4f}")
+    # --- MODEL 2: LOCATION (Zone) ---
+    print("\n--- Training Model 2: Zone ---")
+    y_zone = df['zone']
+    X_train, X_test, y_train, y_test = train_test_split(X, y_zone, test_size=0.2, random_state=42)
     
-    # Save the model
-    model.booster_.save_model(MODEL_PATH)
-    print(f"Model saved to {MODEL_PATH}")
+    zone_model = lgb.LGBMClassifier(
+        n_estimators=2000,
+        learning_rate=0.01, # Slower for Zone because it's "noisier"
+        num_leaves=255,
+        class_weight='balanced',
+        objective='multiclass',
+        n_jobs=-1
+    )
+    zone_model.fit(X_train, y_train, eval_set=[(X_test, y_test)], 
+                   callbacks=[lgb.early_stopping(stopping_rounds=50)])
+    zone_model.booster_.save_model("model_zone_optimized.txt")
 
-    # Feature Importance
-    importance = pd.DataFrame({'feature': FEATURES, 'importance': model.feature_importances_})
-    print("\nTop 5 Most Important Features:")
-    print(importance.sort_values(by='importance', ascending=False).head(5))
+    print("\nSUCCESS: Both Optimized Models Saved!")
 
 if __name__ == "__main__":
-    train_pitch_model()
+    train_dual_optimized()
