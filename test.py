@@ -1,91 +1,63 @@
 import pandas as pd
-import lightgbm as lgb
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report
+import lightgbm as lgb
 
-# --- 1. CONFIGURATION ---
-MODEL_ZONE_PATH = "model_zone_optimized.txt"
-MODEL_TYPE_PATH = "model_type_optimized.txt"
-DATA_PATH = "statcast_final/final_2024.parquet"
-
-FEATURES = [
-    'pitcher', 'batter', 'balls', 'strikes', 'outs_when_up', 
-    'stand', 'p_throws', 'on_1b', 'on_2b', 'on_3b',
-    'batter_rolling_whiff_rate', 'pitcher_ff_usage',
-    'prev_pitch_type', 'prev_zone'
-]
-CAT_FEATURES = ['pitcher', 'batter', 'prev_pitch_type', 'prev_zone', 'stand', 'p_throws']
-
-def calculate_top_k(probs, y_true, k=3):
-    """Calculates if the true value is within the top K predicted probabilities."""
-    top_k_preds = np.argsort(probs, axis=1)[:, -k:]
-    # Convert y_true to a numpy array for faster indexing
-    y_true_arr = y_true.values if hasattr(y_true, 'values') else np.array(y_true)
-    matches = [y_true_arr[i] in top_k_preds[i] for i in range(len(y_true))]
-    return np.mean(matches)
-
-def run_full_test():
-    # --- 2. LOAD DATA & MODELS ---
-    print("Loading data and models...")
-    try:
-        df = pd.read_parquet(DATA_PATH)
-        zone_model = lgb.Booster(model_file=MODEL_ZONE_PATH)
-        type_model = lgb.Booster(model_file=MODEL_TYPE_PATH)
-    except FileNotFoundError as e:
-        print(f"Error: {e}. Make sure your .txt files and parquet data are in the correct folder.")
-        return
-
-    # --- 3. DATA PREPARATION ---
-    # Crucial: Must match training categories exactly
-    for col in CAT_FEATURES:
-        df[col] = df[col].astype('category')
-
-    X = df[FEATURES]
-    y_zone = df['zone']
-    y_type = df['pitch_type'].astype('category').cat.codes # Convert pitch type strings to codes if necessary
-
-    # Split to get a clean test set (20% of data)
-    _, X_test, y_zone_train, y_zone_test = train_test_split(X, y_zone, test_size=0.2, random_state=42)
-    _, _, y_type_train, y_type_test = train_test_split(X, y_type, test_size=0.2, random_state=42)
-
-    # --- 4. TEST ZONE MODEL ---
-    print("\n" + "="*30)
-    print(" TESTING ZONE MODEL (Location)")
-    print("="*30)
+def get_filtered_accuracy(model_path, data, target_col):
+    # 1. Load Model
+    model = lgb.Booster(model_file=model_path)
+    expected_features = model.feature_name()
     
-    zone_probs = zone_model.predict(X_test)
-    zone_preds = np.argmax(zone_probs, axis=1)
+    # 2. Get the Universal Category Mapping (Alphabetical)
+    all_possible_pitches = sorted(df[target_col].unique().tolist())
+    data[target_col] = pd.Categorical(data[target_col], categories=all_possible_pitches)
+    y_true = data[target_col].cat.codes.values
     
-    acc_z1 = accuracy_score(y_zone_test, zone_preds)
-    acc_z3 = calculate_top_k(zone_probs, y_zone_test, k=3)
-    
-    print(f"Top-1 Accuracy (Exact Square): {acc_z1:.2%}")
-    print(f"Top-3 Accuracy (Neighborhood): {acc_z3:.2%}")
+    # 3. BUILD THE REPERTOIRE MASK
+    # We create a mapping of pitcher -> list of pitch codes they actually throw
+    print("🧠 Building Repertoire Mask...")
+    repertoire_map = df.groupby('pitcher')[target_col].unique().apply(
+        lambda x: [all_possible_pitches.index(p) for p in x]
+    ).to_dict()
 
-    # --- 5. TEST PITCH TYPE MODEL ---
-    print("\n" + "="*30)
-    print(" TESTING PITCH TYPE MODEL (Arsenal)")
-    print("="*30)
-    
-    type_probs = type_model.predict(X_test)
-    type_preds = np.argmax(type_probs, axis=1)
-    
-    acc_t1 = accuracy_score(y_type_test, type_preds)
-    acc_t2 = calculate_top_k(type_probs, y_type_test, k=2)
-    
-    print(f"Top-1 Accuracy (Exact Pitch):  {acc_t1:.2%}")
-    print(f"Top-2 Accuracy (Pitch Group):  {acc_t2:.2%}")
+    # 4. Prepare Features
+    X = data[expected_features].copy()
+    for col in X.columns:
+        if X[col].dtype.name == 'category' or X[col].dtype == 'object':
+            all_col_vals = sorted(df[col].unique().tolist())
+            X[col] = pd.Categorical(X[col], categories=all_col_vals).codes
+        X[col] = X[col].fillna(0).astype(np.float32)
 
-    # --- 6. SITUATIONAL ACCURACY (0-2 Counts) ---
-    print("\n--- Situational: 0-2 Counts ---")
-    mask_02 = (X_test['balls'] == 0) & (X_test['strikes'] == 2)
-    if mask_02.any():
-        preds_02 = np.argmax(zone_model.predict(X_test[mask_02]), axis=1)
-        acc_02 = accuracy_score(y_zone_test[mask_02], preds_02)
-        print(f"Zone Accuracy on 0-2 Counts: {acc_02:.2%}")
-    else:
-        print("Not enough 0-2 counts in test sample.")
+    # 5. Get Raw Probabilities
+    raw_probs = model.predict(X.values) # Shape: (50000, 18)
+    
+    # 6. APPLY THE MASK
+    # For every row, find the pitcher and zero out pitches they don't throw
+    filtered_probs = raw_probs.copy()
+    pitcher_ids = data['pitcher'].values
+    
+    for i, p_id in enumerate(pitcher_ids):
+        allowed_indices = repertoire_map.get(p_id, [])
+        # Create a mask of zeros
+        mask = np.zeros(len(all_possible_pitches))
+        mask[allowed_indices] = 1
+        # Multiply probabilities by the mask
+        filtered_probs[i] = filtered_probs[i] * mask
+        
+        # Re-normalize so the sum is 1.0 again
+        if filtered_probs[i].sum() > 0:
+            filtered_probs[i] /= filtered_probs[i].sum()
 
-if __name__ == "__main__":
-    run_full_test()
+    # 7. Calculate Accuracy
+    top1 = np.mean(np.argmax(filtered_probs, axis=1) == y_true) * 100
+    
+    top3_idx = np.argsort(filtered_probs, axis=1)[:, -3:]
+    top3 = np.any(top3_idx == y_true[:, None], axis=1).mean() * 100
+    
+    return top1, top3
+
+# --- RUN ---
+df = pd.read_parquet("final_data.parquet")
+test_sample = df.sample(n=50000, random_state=42).copy()
+
+t1, t3 = get_filtered_accuracy('model_type_optimized.txt', test_sample, 'pitch_type')
+print(f"\n✅ Filtered Pitch Type -> Top 1: {t1:.2f}%, Top 3: {t3:.2f}%")

@@ -19,7 +19,7 @@ USE_COLS = [
     "balls", "strikes", "outs_when_up", "inning", "inning_topbot",
     "game_pk", "game_date", "at_bat_number", "pitch_number",
     "zone", "home_score", "away_score", "on_1b", "on_2b", "on_3b", 
-    "events", "description"
+    "events", "description","release_speed","release_spin_rate",""
 ]
 
 def safe_statcast(start_dt, end_dt, retries=3):
